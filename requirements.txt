@@ -1,0 +1,6 @@
+streamlit>=1.29.0
+requests>=2.31.0
+sentence-transformers>=2.2.2
+torch>=1.13.1
+pymupdf>=1.23.5
+pillow>=10.1.0
