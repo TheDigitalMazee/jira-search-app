@@ -143,6 +143,20 @@ def show_search_form():
             }
     return None
 
+def get_status_color(status_name):
+    """Returns a color based on status name"""
+    status_name = status_name.lower()
+    if 'done' in status_name or 'complete' in status_name:
+        return "🟢"  # Green circle
+    elif 'progress' in status_name or 'in progress' in status_name:
+        return "🟡"  # Yellow circle
+    elif 'backlog' in status_name or 'todo' in status_name:
+        return "⚪"  # White circle
+    elif 'blocked' in status_name or 'stop' in status_name:
+        return "🔴"  # Red circle
+    else:
+        return "🔵"  # Blue circle for other statuses
+
 def display_results(issues, base_url):
     if not issues:
         st.info("No issues found")
@@ -151,10 +165,28 @@ def display_results(issues, base_url):
     debug_log(f"Displaying {len(issues)} results")
     
     for issue in issues[:10]:  # Show top 10 results
-        with st.expander(f"{issue['key']}: {issue['fields']['summary']}"):
-            st.write(f"Status: {issue['fields']['status']['name']}")
-            st.write(issue['fields'].get('description', 'No description'))
-            st.markdown(f"[Open in Jira]({base_url}/browse/{issue['key']})")
+        status_name = issue['fields']['status']['name']
+        status_emoji = get_status_color(status_name)
+        
+        with st.expander(f"{status_emoji} {issue['key']}: {issue['fields']['summary']} ({status_name})"):
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                st.write(f"**Status:** {status_name}")
+                if 'labels' in issue['fields'] and issue['fields']['labels']:
+                    st.write(f"**Labels:** {', '.join(issue['fields']['labels'])}")
+            with col2:
+                st.markdown(f"[Open in Jira ↗]({base_url}/browse/{issue['key']})", unsafe_allow_html=True)
+            
+            st.divider()
+            st.subheader("Description")
+            st.write(issue['fields'].get('description', 'No description provided'))
+            
+            if 'comment' in issue['fields'] and issue['fields']['comment']['comments']:
+                st.divider()
+                st.subheader("Recent Comments")
+                for comment in issue['fields']['comment']['comments'][-3:]:  # Show last 3 comments
+                    st.write(f"**{comment['author']['displayName']}** ({comment['updated'][:10]}):")
+                    st.write(comment['body'])
 
 # ========== MAIN APP ==========
 def main():
