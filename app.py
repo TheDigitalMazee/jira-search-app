@@ -2,10 +2,6 @@ import os
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
-from PIL import Image
-import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import fitz  # PyMuPDF
 import traceback
 import time
 from functools import wraps
@@ -28,7 +24,6 @@ def debug_log(message):
 
 # ========== CONFIGURATION ==========
 ENABLE_SEMANTIC_SEARCH = True
-ENABLE_OCR = False
 MAX_REQUESTS_PER_MINUTE = 30  # Jira Cloud standard rate limit
 
 # ========== INITIALIZATION ==========
@@ -143,20 +138,6 @@ def show_search_form():
             }
     return None
 
-def get_status_color(status_name):
-    """Returns a color based on status name"""
-    status_name = status_name.lower()
-    if 'done' in status_name or 'complete' in status_name:
-        return "🟢"  # Green circle
-    elif 'progress' in status_name or 'in progress' in status_name:
-        return "🟡"  # Yellow circle
-    elif 'backlog' in status_name or 'todo' in status_name:
-        return "⚪"  # White circle
-    elif 'blocked' in status_name or 'stop' in status_name:
-        return "🔴"  # Red circle
-    else:
-        return "🔵"  # Blue circle for other statuses
-
 def display_results(issues, base_url):
     if not issues:
         st.info("No issues found")
@@ -166,9 +147,8 @@ def display_results(issues, base_url):
     
     for issue in issues[:10]:  # Show top 10 results
         status_name = issue['fields']['status']['name']
-        status_emoji = get_status_color(status_name)
         
-        with st.expander(f"{status_emoji} {issue['key']}: {issue['fields']['summary']} ({status_name})"):
+        with st.expander(f"{issue['key']}: {issue['fields']['summary']} [{status_name}]"):
             col1, col2 = st.columns([1, 3])
             with col1:
                 st.write(f"**Status:** {status_name}")
