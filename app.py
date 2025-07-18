@@ -1,7 +1,7 @@
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pandas as pd
 
 # ========== PAGE CONFIG ==========
@@ -38,13 +38,22 @@ def search_jira(base_url, query, auth, max_results=100):
     return response.json().get("issues", [])
 
 def parse_jira_date(date_str):
-    """Handle Jira's date format which sometimes includes milliseconds and timezone"""
+    """Handle Jira's date format with timezone awareness"""
     try:
-        # Try ISO format first
-        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-    except ValueError:
-        # Fallback for non-standard formats
-        return datetime.strptime(date_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+        # Remove milliseconds if present
+        if '.' in date_str:
+            date_str = date_str.split('.')[0] + date_str[-6:]  # Keep timezone
+        
+        # Handle different timezone formats
+        if date_str.endswith('Z'):
+            return datetime.fromisoformat(date_str[:-1] + '+00:00').astimezone()
+        elif '+' in date_str or '-' in date_str[-6:]:
+            return datetime.fromisoformat(date_str).astimezone()
+        else:
+            return datetime.fromisoformat(date_str + '+00:00').astimezone()
+    except ValueError as e:
+        st.error(f"Error parsing date: {date_str} - {str(e)}")
+        return datetime.now(timezone.utc)  # Fallback to current time
 
 # ========== UI COMPONENTS ==========
 def show_search_form():
@@ -94,7 +103,7 @@ def show_results_filters(issues):
                 "Last 1 year": 365
             }
             days = days_map[date_options]
-            cutoff = datetime.now() - timedelta(days=days)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
             filtered = [i for i in filtered if parse_jira_date(i['fields']['updated']) > cutoff]
         if selected_statuses:
             filtered = [i for i in filtered if i['fields']['status']['name'] in selected_statuses]
@@ -108,6 +117,7 @@ def display_results(issues, base_url):
     for issue in issues[start:end]:
         project = issue['key'].split('-')[0]
         status = issue['fields']['status']['name']
+        updated_date = parse_jira_date(issue['fields']['updated'])
         
         with st.container(border=True):
             # Header
@@ -135,7 +145,6 @@ def display_results(issues, base_url):
                     st.text("Labels: " + ", ".join(issue['fields']['labels']))
                 
             with cols[1]:
-                updated_date = parse_jira_date(issue['fields']['updated'])
                 st.markdown(f"**Updated:** {updated_date.strftime('%Y-%m-%d')}")
                 st.markdown(f"[Open in Jira ↗]({base_url}/browse/{issue['key']})", unsafe_allow_html=True)
 
