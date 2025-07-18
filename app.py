@@ -88,7 +88,7 @@ def search_jira_issues(base_url, query, auth_credentials, max_results=50):
         if response.status_code == 403:
             debug_log(f"403 Forbidden - Response: {response.text}")
             st.cache_data.clear()  # Clear cached results on auth failure
-            st.error("Access denied. Please check your API token and permissions.")
+            st.error("Access denied. Please check your credentials.")
             return []
         elif response.status_code == 429:
             debug_log("Rate limit exceeded")
@@ -104,7 +104,7 @@ def search_jira_issues(base_url, query, auth_credentials, max_results=50):
         debug_log(f"Search error: {traceback.format_exc()}")
         if isinstance(e, requests.exceptions.HTTPError):
             if e.response.status_code == 403:
-                st.error("Access denied. Please verify your API token has proper permissions.")
+                st.error("Access denied. Please verify your credentials.")
             else:
                 st.error(f"HTTP Error: {str(e)}")
         else:
@@ -120,19 +120,20 @@ def show_search_form():
     with st.form("search_form"):
         base_url = st.text_input("Jira Base URL", placeholder="https://your-company.atlassian.net")
         username = st.text_input("Username or Email")
-        api_token = st.text_input("API Token", type="password")
+        password = st.text_input("Password", type="password",
+                               help="For Jira Cloud, use an API token. For Jira Server, use your account password.")
         query = st.text_input("Search Query")
         submitted = st.form_submit_button("Search")
         
         if submitted:
-            if not all([base_url, username, api_token, query]):
+            if not all([base_url, username, password, query]):
                 st.warning("Please fill all fields")
                 return None
             return {
                 "base_url": base_url,
                 "auth_credentials": {
                     'username': username,
-                    'password': api_token
+                    'password': password
                 },
                 "query": query
             }
@@ -179,6 +180,18 @@ def main():
             st.write(f"Semantic Search: {'Enabled' if SEMANTIC_SEARCH_AVAILABLE else 'Disabled'}")
             st.write(f"Rate Limit: {MAX_REQUESTS_PER_MINUTE} requests/minute")
     
+    # Help text about authentication
+    with st.expander("ℹ️ Authentication Help", expanded=False):
+        st.write("""
+        **For Jira Cloud:**  
+        - Username: Your email address  
+        - Password: An API token (create one at [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens))  
+        
+        **For Jira Server/Data Center:**  
+        - Username: Your account username  
+        - Password: Your account password  
+        """)
+    
     # Search form
     search_params = show_search_form()
     
@@ -200,7 +213,7 @@ def main():
                     test_response = test_session.get(test_url, timeout=10)
                     if test_response.status_code == 403:
                         st.cache_data.clear()
-                        st.error("Authentication failed. Please check your credentials and API token.")
+                        st.error("Authentication failed. Please check your credentials.")
                         return
                     test_response.raise_for_status()
                 except requests.exceptions.RequestException as e:
