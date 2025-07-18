@@ -2,7 +2,6 @@ import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
 from datetime import datetime, timedelta, timezone
-import pandas as pd
 
 # ========== PAGE CONFIG ==========
 st.set_page_config(
@@ -25,13 +24,41 @@ if 'auth_verified' not in st.session_state:
     st.session_state.auth_verified = False
 
 # ========== CORE FUNCTIONS ==========
+def build_jql(query, project_filter=None, date_filter=None):
+    """Enhanced JQL builder with term boosting"""
+    # Boost exact matches and important terms
+    if '"' not in query:  # Not an exact phrase search
+        terms = []
+        for word in query.split():
+            if word.lower() in ['error', 'fail', 'crash', 'bug']:
+                terms.append(f'"{word}"^3')
+            elif len(word) > 3:  # Boost longer terms more
+                terms.append(f'"{word}"^2')
+            else:
+                terms.append(f'"{word}"')
+        text_query = " AND ".join(terms)
+    else:
+        text_query = query
+    
+    jql_parts = [
+        f'(summary ~ "{text_query}"^3 OR description ~ "{text_query}"^2 OR comment ~ "{text_query}")'
+    ]
+    
+    if project_filter:
+        jql_parts.append(f'project in ({",".join(project_filter)})')
+    
+    if date_filter:
+        jql_parts.append(f'updated >= "{date_filter}"')
+    
+    return " AND ".join(jql_parts) + " ORDER BY updated DESC"
+
 def search_jira(base_url, query, auth, max_results=100):
-    jql = f'text ~ "{query}" ORDER BY updated DESC'
+    jql = build_jql(query)
     url = f"{base_url}/rest/api/2/search"
     params = {
         "jql": jql,
         "maxResults": max_results,
-        "fields": "summary,description,status,labels,project,updated,attachment,key"
+        "fields": "summary,description,status,labels,project,updated,attachment,key,comment"
     }
     response = requests.get(url, params=params, auth=auth, timeout=30)
     response.raise_for_status()
@@ -40,75 +67,81 @@ def search_jira(base_url, query, auth, max_results=100):
 def parse_jira_date(date_str):
     """Handle Jira's date format with timezone awareness"""
     try:
-        # Remove milliseconds if present
         if '.' in date_str:
             date_str = date_str.split('.')[0] + date_str[-6:]  # Keep timezone
-        
-        # Handle different timezone formats
         if date_str.endswith('Z'):
             return datetime.fromisoformat(date_str[:-1] + '+00:00').astimezone()
         elif '+' in date_str or '-' in date_str[-6:]:
             return datetime.fromisoformat(date_str).astimezone()
-        else:
-            return datetime.fromisoformat(date_str + '+00:00').astimezone()
-    except ValueError as e:
-        st.error(f"Error parsing date: {date_str} - {str(e)}")
-        return datetime.now(timezone.utc)  # Fallback to current time
+        return datetime.fromisoformat(date_str + '+00:00').astimezone()
+    except ValueError:
+        return datetime.now(timezone.utc)
+
+def format_description(desc):
+    """Improved description formatting with table support"""
+    if not desc:
+        return "No description available"
+    
+    # Format Jira tables as code blocks
+    if "||" in desc or "|" in desc:
+        return f"```\n{desc}\n```"
+    
+    # Truncate long descriptions
+    return desc[:500] + ("..." if len(desc) > 500 else "")
 
 # ========== UI COMPONENTS ==========
 def show_search_form():
     with st.form("main_search"):
-        query = st.text_input("Search Query", placeholder="Enter error code or keywords", key="search_query")
-        submit = st.form_submit_button("Search Jira")
-        
-        if submit and query:
-            return query.strip()
-    return None
+        query = st.text_input("Search Query", 
+                            placeholder="Try: 'error 2001' or \"exact phrase\"", 
+                            key="search_query")
+        submit = st.form_submit_button("🔍 Search Jira")
+        return query.strip() if submit else None
 
 def show_results_filters(issues):
     with st.expander("🔍 Filter Results", expanded=True):
-        # Extract all unique project types from results
-        projects = sorted(list({issue['key'].split('-')[0] for issue in issues}))
+        projects = sorted({issue['key'].split('-')[0] for issue in issues})
         
         col1, col2, col3 = st.columns(3)
         with col1:
             selected_projects = st.multiselect(
-                "Project Types",
-                options=projects,
-                default=projects
-            )
+                "Project Types", options=projects, default=projects)
         with col2:
-            date_options = st.selectbox(
+            date_filter = st.selectbox(
                 "Updated Timeframe",
-                options=["All", "Last 7 days", "Last 30 days", "Last 90 days", "Last 1 year"],
-                index=0
-            )
+                options=["All", "Last 7 days", "Last 30 days", "Last 90 days", "Last 1 year"])
         with col3:
-            statuses = sorted(list({issue['fields']['status']['name'] for issue in issues}))
-            selected_statuses = st.multiselect(
-                "Status",
-                options=statuses,
-                default=statuses
-            )
+            statuses = sorted({issue['fields']['status']['name'] for issue in issues})
+            selected_statuses = st.multiselect("Status", options=statuses, default=statuses)
         
         # Apply filters
         filtered = issues
         if selected_projects:
             filtered = [i for i in filtered if i['key'].split('-')[0] in selected_projects]
-        if date_options != "All":
-            days_map = {
-                "Last 7 days": 7,
-                "Last 30 days": 30,
-                "Last 90 days": 90,
-                "Last 1 year": 365
-            }
-            days = days_map[date_options]
+        if date_filter != "All":
+            days = {"Last 7 days":7, "Last 30 days":30, "Last 90 days":90, "Last 1 year":365}[date_filter]
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
             filtered = [i for i in filtered if parse_jira_date(i['fields']['updated']) > cutoff]
         if selected_statuses:
             filtered = [i for i in filtered if i['fields']['status']['name'] in selected_statuses]
         
         return filtered
+
+def display_attachments(attachments):
+    """Preview attachments with image support"""
+    if not attachments:
+        return
+    
+    with st.expander(f"📎 Attachments ({len(attachments)})"):
+        for att in attachments[:3]:  # Show first 3 attachments
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                if att['mimeType'].startswith('image'):
+                    st.image(att['content'], caption=att['filename'], width=150)
+                else:
+                    st.markdown(f"`{att['filename']}`")
+            with col2:
+                st.markdown(f"[View full content ↗]({att['content']})")
 
 def display_results(issues, base_url):
     start = (st.session_state.page - 1) * RESULTS_PER_PAGE
@@ -117,60 +150,62 @@ def display_results(issues, base_url):
     for issue in issues[start:end]:
         project = issue['key'].split('-')[0]
         status = issue['fields']['status']['name']
-        updated_date = parse_jira_date(issue['fields']['updated'])
+        updated = parse_jira_date(issue['fields']['updated'])
         
         with st.container(border=True):
-            # Header
+            # Header with project and status
             st.markdown(f"""
-            <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
-                <h3 style="margin: 0;">{issue['key']}: {issue['fields']['summary']}</h3>
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
                 <div>
-                    <span style="background: #e0e0e0; padding: 3px 8px; border-radius: 4px;">
+                    <span style="font-size:18px; font-weight:bold;">{issue['key']}: {issue['fields']['summary']}</span>
+                    <span style="background:#e0e0e0; padding:2px 8px; border-radius:4px; margin-left:8px; font-size:12px;">
                         {project}
                     </span>
-                    <span style="color: {'green' if status == 'Done' else 'orange'}; margin-left: 10px;">
-                        {status}
-                    </span>
                 </div>
+                <span style="color:{'green' if status == 'Done' else 'orange'};">
+                    {status} • {updated.strftime('%Y-%m-%d')}
+                </span>
             </div>
             """, unsafe_allow_html=True)
             
-            # Body
-            cols = st.columns([3, 1])
-            with cols[0]:
-                desc = issue['fields'].get('description', 'No description available')
-                st.text(desc[:250] + ("..." if len(desc) > 250 else ""))
-                
-                if 'labels' in issue['fields'] and issue['fields']['labels']:
-                    st.text("Labels: " + ", ".join(issue['fields']['labels']))
-                
-            with cols[1]:
-                st.markdown(f"**Updated:** {updated_date.strftime('%Y-%m-%d')}")
-                st.markdown(f"[Open in Jira ↗]({base_url}/browse/{issue['key']})", unsafe_allow_html=True)
+            # Description with improved formatting
+            st.markdown(format_description(issue['fields'].get('description')))
+            
+            # Labels and comments count
+            cols = st.columns(3)
+            if 'labels' in issue['fields'] and issue['fields']['labels']:
+                cols[0].markdown(f"**Labels:** {', '.join(issue['fields']['labels'])}")
+            if 'comment' in issue['fields']:
+                cols[1].markdown(f"**Comments:** {len(issue['fields']['comment']['comments'])}")
+            cols[2].markdown(f"[Open in Jira ↗]({base_url}/browse/{issue['key']})", unsafe_allow_html=True)
+            
+            # Attachments preview
+            if 'attachment' in issue['fields']:
+                display_attachments(issue['fields']['attachment'])
 
 def show_pagination(total_items):
     total_pages = (total_items + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
     if total_pages > 1:
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            if st.button("◀ Previous") and st.session_state.page > 1:
+        cols = st.columns([1, 2, 1])
+        with cols[0]:
+            if st.button("◀ Previous", disabled=st.session_state.page <= 1):
                 st.session_state.page -= 1
-        with col2:
+        with cols[1]:
             st.markdown(f"**Page {st.session_state.page} of {total_pages}**", unsafe_allow_html=True)
-        with col3:
-            if st.button("Next ▶") and st.session_state.page < total_pages:
+        with cols[2]:
+            if st.button("Next ▶", disabled=st.session_state.page >= total_pages):
                 st.session_state.page += 1
 
 # ========== MAIN APP ==========
 def main():
     st.title("🔍 Jira Search Pro+")
     
-    # Authentication - no need to press enter
-    base_url = st.text_input("Jira URL", placeholder="https://your-company.atlassian.net", key="jira_url")
-    username = st.text_input("Username", key="jira_user")
-    password = st.text_input("Password", type="password", key="jira_pass")
+    # Authentication
+    base_url = st.text_input("Jira URL", placeholder="https://your-company.atlassian.net")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
     
-    # Store auth state when all fields are filled
+    # Verify auth when all fields are filled
     if base_url and username and password:
         auth = HTTPBasicAuth(username, password)
         st.session_state.auth_verified = True
@@ -181,17 +216,17 @@ def main():
     query = show_search_form()
     
     if query and st.session_state.auth_verified:
-        with st.spinner(f"Searching for '{query}'..."):
+        with st.spinner(f"🔍 Searching for '{query}'..."):
             try:
                 issues = search_jira(base_url, query, auth)
                 st.session_state.raw_results = issues
                 st.session_state.filtered_results = issues
-                st.session_state.page = 1  # Reset to first page
+                st.session_state.page = 1
             except Exception as e:
                 st.error(f"Search failed: {str(e)}")
                 return
     
-    # Show filters and results if available
+    # Display results
     if st.session_state.raw_results:
         st.session_state.filtered_results = show_results_filters(st.session_state.raw_results)
         st.markdown(f"**Found {len(st.session_state.raw_results)} results** ({len(st.session_state.filtered_results)} after filtering)")
