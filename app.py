@@ -25,44 +25,68 @@ if 'auth_verified' not in st.session_state:
 
 # ========== CORE FUNCTIONS ==========
 def build_jql(query, project_filter=None, date_filter=None):
-    """Enhanced JQL builder with term boosting"""
-    # Boost exact matches and important terms
-    if '"' not in query:  # Not an exact phrase search
+    """Enhanced JQL builder with proper term handling"""
+    jql_parts = []
+    
+    # Handle exact phrase searches
+    if '"' in query:
+        text_query = query
+        jql_parts.append(f'(summary ~ {text_query}^3 OR description ~ {text_query}^2 OR comment ~ {text_query})')
+    else:
+        # Process individual terms
         terms = []
         for word in query.split():
-            if word.lower() in ['error', 'fail', 'crash', 'bug']:
-                terms.append(f'"{word}"^3')
-            elif len(word) > 3:  # Boost longer terms more
-                terms.append(f'"{word}"^2')
+            if word.isdigit():
+                # Handle numeric terms directly
+                terms.append(word)
             else:
-                terms.append(f'"{word}"')
-        text_query = " AND ".join(terms)
-    else:
-        text_query = query
+                # Boost important keywords
+                boost = "^2" if word.lower() in ['error', 'fail', 'crash', 'bug'] else ""
+                terms.append(f'"{word}"{boost}')
+        
+        # Build field-specific queries
+        text_conditions = []
+        if terms:
+            term_string = " AND ".join(terms)
+            text_conditions.append(f'summary ~ {term_string}^3')
+            text_conditions.append(f'description ~ {term_string}^2')
+            text_conditions.append(f'comment ~ {term_string}')
+        
+        if text_conditions:
+            jql_parts.append(f"({' OR '.join(text_conditions)})")
     
-    jql_parts = [
-        f'(summary ~ "{text_query}"^3 OR description ~ "{text_query}"^2 OR comment ~ "{text_query}")'
-    ]
-    
+    # Add project filter if specified
     if project_filter:
         jql_parts.append(f'project in ({",".join(project_filter)})')
     
+    # Add date filter if specified
     if date_filter:
         jql_parts.append(f'updated >= "{date_filter}"')
     
-    return " AND ".join(jql_parts) + " ORDER BY updated DESC"
+    # Default sorting
+    jql = " AND ".join(jql_parts) + " ORDER BY updated DESC"
+    
+    # Clean up any potential syntax issues
+    jql = jql.replace('""', '"').replace('~~', '~')
+    return jql
 
 def search_jira(base_url, query, auth, max_results=100):
-    jql = build_jql(query)
-    url = f"{base_url}/rest/api/2/search"
-    params = {
-        "jql": jql,
-        "maxResults": max_results,
-        "fields": "summary,description,status,labels,project,updated,attachment,key,comment"
-    }
-    response = requests.get(url, params=params, auth=auth, timeout=30)
-    response.raise_for_status()
-    return response.json().get("issues", [])
+    try:
+        jql = build_jql(query)
+        debug_log(f"Generated JQL: {jql}")
+        
+        url = f"{base_url}/rest/api/2/search"
+        params = {
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": "summary,description,status,labels,project,updated,attachment,key,comment"
+        }
+        response = requests.get(url, params=params, auth=auth, timeout=30)
+        response.raise_for_status()
+        return response.json().get("issues", [])
+    except Exception as e:
+        debug_log(f"Search error: {str(e)}")
+        raise e
 
 def parse_jira_date(date_str):
     """Handle Jira's date format with timezone awareness"""
@@ -93,7 +117,7 @@ def format_description(desc):
 def show_search_form():
     with st.form("main_search"):
         query = st.text_input("Search Query", 
-                            placeholder="Try: 'error 2001' or \"exact phrase\"", 
+                            placeholder='Try: "error 2400" or exact phrases in quotes', 
                             key="search_query")
         submit = st.form_submit_button("🔍 Search Jira")
         return query.strip() if submit else None
@@ -196,6 +220,11 @@ def show_pagination(total_items):
             if st.button("Next ▶", disabled=st.session_state.page >= total_pages):
                 st.session_state.page += 1
 
+def debug_log(message):
+    if DEBUG:
+        with st.sidebar.expander("Debug Log", expanded=False):
+            st.write(message)
+
 # ========== MAIN APP ==========
 def main():
     st.title("🔍 Jira Search Pro+")
@@ -238,4 +267,5 @@ def main():
             st.warning("No results match your filters")
 
 if __name__ == "__main__":
+    DEBUG = st.secrets.get("DEBUG", False) if hasattr(st, "secrets") else False
     main()
