@@ -21,6 +21,8 @@ if 'filtered_results' not in st.session_state:
     st.session_state.filtered_results = []
 if 'page' not in st.session_state:
     st.session_state.page = 1
+if 'auth_verified' not in st.session_state:
+    st.session_state.auth_verified = False
 
 # ========== CORE FUNCTIONS ==========
 def search_jira(base_url, query, auth, max_results=100):
@@ -35,15 +37,20 @@ def search_jira(base_url, query, auth, max_results=100):
     response.raise_for_status()
     return response.json().get("issues", [])
 
+def parse_jira_date(date_str):
+    """Handle Jira's date format which sometimes includes milliseconds and timezone"""
+    try:
+        # Try ISO format first
+        return datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+    except ValueError:
+        # Fallback for non-standard formats
+        return datetime.strptime(date_str.split('.')[0], "%Y-%m-%dT%H:%M:%S")
+
 # ========== UI COMPONENTS ==========
 def show_search_form():
     with st.form("main_search"):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            query = st.text_input("Search Query", placeholder="Enter error code or keywords")
-        with col2:
-            st.text("")  # Vertical spacing
-            submit = st.form_submit_button("Search Jira")
+        query = st.text_input("Search Query", placeholder="Enter error code or keywords", key="search_query")
+        submit = st.form_submit_button("Search Jira")
         
         if submit and query:
             return query.strip()
@@ -64,7 +71,7 @@ def show_results_filters(issues):
         with col2:
             date_options = st.selectbox(
                 "Updated Timeframe",
-                options=["All", "Last 7 days", "Last 30 days", "Last 90 days"],
+                options=["All", "Last 7 days", "Last 30 days", "Last 90 days", "Last 1 year"],
                 index=0
             )
         with col3:
@@ -80,9 +87,15 @@ def show_results_filters(issues):
         if selected_projects:
             filtered = [i for i in filtered if i['key'].split('-')[0] in selected_projects]
         if date_options != "All":
-            days = int(date_options.split()[1])
+            days_map = {
+                "Last 7 days": 7,
+                "Last 30 days": 30,
+                "Last 90 days": 90,
+                "Last 1 year": 365
+            }
+            days = days_map[date_options]
             cutoff = datetime.now() - timedelta(days=days)
-            filtered = [i for i in filtered if datetime.fromisoformat(i['fields']['updated'][:-1]) > cutoff]
+            filtered = [i for i in filtered if parse_jira_date(i['fields']['updated']) > cutoff]
         if selected_statuses:
             filtered = [i for i in filtered if i['fields']['status']['name'] in selected_statuses]
         
@@ -122,7 +135,8 @@ def display_results(issues, base_url):
                     st.text("Labels: " + ", ".join(issue['fields']['labels']))
                 
             with cols[1]:
-                st.markdown(f"**Updated:** {issue['fields']['updated'][:10]}")
+                updated_date = parse_jira_date(issue['fields']['updated'])
+                st.markdown(f"**Updated:** {updated_date.strftime('%Y-%m-%d')}")
                 st.markdown(f"[Open in Jira ↗]({base_url}/browse/{issue['key']})", unsafe_allow_html=True)
 
 def show_pagination(total_items):
@@ -142,18 +156,22 @@ def show_pagination(total_items):
 def main():
     st.title("🔍 Jira Search Pro+")
     
-    # Simple auth form
-    with st.sidebar:
-        st.subheader("Authentication")
-        base_url = st.text_input("Jira URL", placeholder="https://your-company.atlassian.net")
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        auth = HTTPBasicAuth(username, password) if username and password else None
+    # Authentication - no need to press enter
+    base_url = st.text_input("Jira URL", placeholder="https://your-company.atlassian.net", key="jira_url")
+    username = st.text_input("Username", key="jira_user")
+    password = st.text_input("Password", type="password", key="jira_pass")
+    
+    # Store auth state when all fields are filled
+    if base_url and username and password:
+        auth = HTTPBasicAuth(username, password)
+        st.session_state.auth_verified = True
+    else:
+        st.session_state.auth_verified = False
     
     # Main search
     query = show_search_form()
     
-    if query and auth:
+    if query and st.session_state.auth_verified:
         with st.spinner(f"Searching for '{query}'..."):
             try:
                 issues = search_jira(base_url, query, auth)
