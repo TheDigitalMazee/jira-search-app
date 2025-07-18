@@ -1,238 +1,179 @@
-import os
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
-import traceback
-import time
-from functools import wraps
-from tenacity import retry, stop_after_attempt, wait_exponential
+from datetime import datetime, timedelta
+import pandas as pd
 
 # ========== PAGE CONFIG ==========
 st.set_page_config(
-    page_title="Jira Search Pro",
-    layout="centered",
+    page_title="Jira Search Pro+",
+    layout="wide",
     page_icon="🔍"
 )
 
-# ========== DEBUGGING SETUP ==========
-DEBUG = False  # Set to False in production
+# ========== CONSTANTS ==========
+RESULTS_PER_PAGE = 10
 
-def debug_log(message):
-    if DEBUG:
-        with st.sidebar.expander("Debug Log", expanded=False):
-            st.write(message)
-
-# ========== CONFIGURATION ==========
-ENABLE_SEMANTIC_SEARCH = True
-MAX_REQUESTS_PER_MINUTE = 30  # Jira Cloud standard rate limit
-
-# ========== INITIALIZATION ==========
-try:
-    if ENABLE_SEMANTIC_SEARCH:
-        from sentence_transformers import SentenceTransformer, util
-        SEMANTIC_SEARCH_AVAILABLE = True
-        
-        @st.cache_resource
-        def load_model():
-            debug_log("Loading ML model...")
-            return SentenceTransformer('all-MiniLM-L6-v2')
-    else:
-        SEMANTIC_SEARCH_AVAILABLE = False
-except Exception as e:
-    debug_log(f"Model loading failed: {str(e)}")
-    SEMANTIC_SEARCH_AVAILABLE = False
-
-# ========== RATE LIMITING DECORATOR ==========
-def rate_limited(max_per_minute):
-    interval = 60.0 / float(max_per_minute)
-    def decorator(func):
-        last_time = [0.0]
-        @wraps(func)
-        def rate_limited_function(*args, **kwargs):
-            elapsed = time.time() - last_time[0]
-            wait_time = interval - elapsed
-            if wait_time > 0:
-                time.sleep(wait_time)
-            last_time[0] = time.time()
-            return func(*args, **kwargs)
-        return rate_limited_function
-    return decorator
+# ========== SESSION STATE ==========
+if 'raw_results' not in st.session_state:
+    st.session_state.raw_results = []
+if 'filtered_results' not in st.session_state:
+    st.session_state.filtered_results = []
+if 'page' not in st.session_state:
+    st.session_state.page = 1
 
 # ========== CORE FUNCTIONS ==========
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
-@rate_limited(MAX_REQUESTS_PER_MINUTE)
-@st.cache_data(ttl=3600)
-def search_jira_issues(base_url, query, auth_credentials, max_results=50):
-    debug_log(f"Searching Jira with query: {query}")
-    try:
-        session = requests.Session()
-        session.auth = HTTPBasicAuth(auth_credentials['username'], auth_credentials['password'])
-        session.headers.update({
-            "Accept": "application/json",
-            "User-Agent": "JiraSearchPro/1.0"
-        })
-        
-        url = f"{base_url}/rest/api/2/search"
-        params = {
-            "jql": f'text~"{query}" ORDER BY updated DESC',
-            "maxResults": max_results,
-            "fields": "summary,description,comment,status,attachment,labels"
-        }
-        
-        debug_log(f"Request URL: {url}")
-        debug_log(f"Params: {params}")
-        
-        response = session.get(url, params=params, timeout=30)
-        
-        # Handle specific error cases
-        if response.status_code == 403:
-            debug_log(f"403 Forbidden - Response: {response.text}")
-            st.cache_data.clear()  # Clear cached results on auth failure
-            st.error("Access denied. Please check your credentials.")
-            return []
-        elif response.status_code == 429:
-            debug_log("Rate limit exceeded")
-            st.warning("Jira rate limit exceeded. Please wait a minute and try again.")
-            return []
-            
-        response.raise_for_status()
-        
-        debug_log(f"Response status: {response.status_code}")
-        return response.json().get("issues", [])
-        
-    except requests.exceptions.RequestException as e:
-        debug_log(f"Search error: {traceback.format_exc()}")
-        if isinstance(e, requests.exceptions.HTTPError):
-            if e.response.status_code == 403:
-                st.error("Access denied. Please verify your credentials.")
-            else:
-                st.error(f"HTTP Error: {str(e)}")
-        else:
-            st.error(f"Search failed: {str(e)}")
-        return []
-    except Exception as e:
-        debug_log(f"Unexpected error: {traceback.format_exc()}")
-        st.error(f"An unexpected error occurred: {str(e)}")
-        return []
+def search_jira(base_url, query, auth, max_results=100):
+    jql = f'text ~ "{query}" ORDER BY updated DESC'
+    url = f"{base_url}/rest/api/2/search"
+    params = {
+        "jql": jql,
+        "maxResults": max_results,
+        "fields": "summary,description,status,labels,project,updated,attachment,key"
+    }
+    response = requests.get(url, params=params, auth=auth, timeout=30)
+    response.raise_for_status()
+    return response.json().get("issues", [])
 
 # ========== UI COMPONENTS ==========
 def show_search_form():
-    with st.form("search_form"):
-        base_url = st.text_input("Jira Base URL", placeholder="https://your-company.atlassian.net")
-        username = st.text_input("Username or Email")
-        password = st.text_input("Password", type="password",
-                               help="For Jira Cloud, use an API token. For Jira Server, use your account password.")
-        query = st.text_input("Search Query")
-        submitted = st.form_submit_button("Search")
+    with st.form("main_search"):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            query = st.text_input("Search Query", placeholder="Enter error code or keywords")
+        with col2:
+            st.text("")  # Vertical spacing
+            submit = st.form_submit_button("Search Jira")
         
-        if submitted:
-            if not all([base_url, username, password, query]):
-                st.warning("Please fill all fields")
-                return None
-            return {
-                "base_url": base_url,
-                "auth_credentials": {
-                    'username': username,
-                    'password': password
-                },
-                "query": query
-            }
+        if submit and query:
+            return query.strip()
     return None
 
-def display_results(issues, base_url):
-    if not issues:
-        st.info("No issues found")
-        return
-    
-    debug_log(f"Displaying {len(issues)} results")
-    
-    for issue in issues[:10]:  # Show top 10 results
-        status_name = issue['fields']['status']['name']
+def show_results_filters(issues):
+    with st.expander("🔍 Filter Results", expanded=True):
+        # Extract all unique project types from results
+        projects = sorted(list({issue['key'].split('-')[0] for issue in issues}))
         
-        with st.expander(f"{issue['key']}: {issue['fields']['summary']} [{status_name}]"):
-            col1, col2 = st.columns([1, 3])
-            with col1:
-                st.write(f"**Status:** {status_name}")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            selected_projects = st.multiselect(
+                "Project Types",
+                options=projects,
+                default=projects
+            )
+        with col2:
+            date_options = st.selectbox(
+                "Updated Timeframe",
+                options=["All", "Last 7 days", "Last 30 days", "Last 90 days"],
+                index=0
+            )
+        with col3:
+            statuses = sorted(list({issue['fields']['status']['name'] for issue in issues}))
+            selected_statuses = st.multiselect(
+                "Status",
+                options=statuses,
+                default=statuses
+            )
+        
+        # Apply filters
+        filtered = issues
+        if selected_projects:
+            filtered = [i for i in filtered if i['key'].split('-')[0] in selected_projects]
+        if date_options != "All":
+            days = int(date_options.split()[1])
+            cutoff = datetime.now() - timedelta(days=days)
+            filtered = [i for i in filtered if datetime.fromisoformat(i['fields']['updated'][:-1]) > cutoff]
+        if selected_statuses:
+            filtered = [i for i in filtered if i['fields']['status']['name'] in selected_statuses]
+        
+        return filtered
+
+def display_results(issues, base_url):
+    start = (st.session_state.page - 1) * RESULTS_PER_PAGE
+    end = start + RESULTS_PER_PAGE
+    
+    for issue in issues[start:end]:
+        project = issue['key'].split('-')[0]
+        status = issue['fields']['status']['name']
+        
+        with st.container(border=True):
+            # Header
+            st.markdown(f"""
+            <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
+                <h3 style="margin: 0;">{issue['key']}: {issue['fields']['summary']}</h3>
+                <div>
+                    <span style="background: #e0e0e0; padding: 3px 8px; border-radius: 4px;">
+                        {project}
+                    </span>
+                    <span style="color: {'green' if status == 'Done' else 'orange'}; margin-left: 10px;">
+                        {status}
+                    </span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Body
+            cols = st.columns([3, 1])
+            with cols[0]:
+                desc = issue['fields'].get('description', 'No description available')
+                st.text(desc[:250] + ("..." if len(desc) > 250 else ""))
+                
                 if 'labels' in issue['fields'] and issue['fields']['labels']:
-                    st.write(f"**Labels:** {', '.join(issue['fields']['labels'])}")
-            with col2:
+                    st.text("Labels: " + ", ".join(issue['fields']['labels']))
+                
+            with cols[1]:
+                st.markdown(f"**Updated:** {issue['fields']['updated'][:10]}")
                 st.markdown(f"[Open in Jira ↗]({base_url}/browse/{issue['key']})", unsafe_allow_html=True)
-            
-            st.divider()
-            st.subheader("Description")
-            st.write(issue['fields'].get('description', 'No description provided'))
-            
-            if 'comment' in issue['fields'] and issue['fields']['comment']['comments']:
-                st.divider()
-                st.subheader("Recent Comments")
-                for comment in issue['fields']['comment']['comments'][-3:]:  # Show last 3 comments
-                    st.write(f"**{comment['author']['displayName']}** ({comment['updated'][:10]}):")
-                    st.write(comment['body'])
+
+def show_pagination(total_items):
+    total_pages = (total_items + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+    if total_pages > 1:
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col1:
+            if st.button("◀ Previous") and st.session_state.page > 1:
+                st.session_state.page -= 1
+        with col2:
+            st.markdown(f"**Page {st.session_state.page} of {total_pages}**", unsafe_allow_html=True)
+        with col3:
+            if st.button("Next ▶") and st.session_state.page < total_pages:
+                st.session_state.page += 1
 
 # ========== MAIN APP ==========
 def main():
-    st.title("🔍 Jira Search Pro")
+    st.title("🔍 Jira Search Pro+")
     
-    # Show debug info if enabled
-    if DEBUG:
-        with st.sidebar:
-            st.subheader("Debug Information")
-            st.write(f"Semantic Search: {'Enabled' if SEMANTIC_SEARCH_AVAILABLE else 'Disabled'}")
-            st.write(f"Rate Limit: {MAX_REQUESTS_PER_MINUTE} requests/minute")
+    # Simple auth form
+    with st.sidebar:
+        st.subheader("Authentication")
+        base_url = st.text_input("Jira URL", placeholder="https://your-company.atlassian.net")
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        auth = HTTPBasicAuth(username, password) if username and password else None
     
-    # Help text about authentication
-    with st.expander("ℹ️ Authentication Help", expanded=False):
-        st.write("""
-        **For Jira Cloud:**  
-        - Username: Your email address  
-        - Password: An API token (create one at [https://id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens))  
-        
-        **For Jira Server/Data Center:**  
-        - Username: Your account username  
-        - Password: Your account password  
-        """)
+    # Main search
+    query = show_search_form()
     
-    # Search form
-    search_params = show_search_form()
-    
-    # Process search
-    if search_params:
-        with st.spinner("Searching Jira..."):
+    if query and auth:
+        with st.spinner(f"Searching for '{query}'..."):
             try:
-                debug_log("Starting search...")
-                
-                # First verify credentials with a simple request
-                test_session = requests.Session()
-                test_session.auth = HTTPBasicAuth(
-                    search_params['auth_credentials']['username'],
-                    search_params['auth_credentials']['password']
-                )
-                test_url = f"{search_params['base_url']}/rest/api/2/myself"
-                
-                try:
-                    test_response = test_session.get(test_url, timeout=10)
-                    if test_response.status_code == 403:
-                        st.cache_data.clear()
-                        st.error("Authentication failed. Please check your credentials.")
-                        return
-                    test_response.raise_for_status()
-                except requests.exceptions.RequestException as e:
-                    st.cache_data.clear()
-                    st.error(f"Authentication test failed: {str(e)}")
-                    return
-                
-                # If auth test passed, proceed with search
-                issues = search_jira_issues(
-                    search_params["base_url"],
-                    search_params["query"],
-                    search_params["auth_credentials"]
-                )
-                
-                display_results(issues, search_params["base_url"])
-                
+                issues = search_jira(base_url, query, auth)
+                st.session_state.raw_results = issues
+                st.session_state.filtered_results = issues
+                st.session_state.page = 1  # Reset to first page
             except Exception as e:
-                debug_log(f"Main execution error: {traceback.format_exc()}")
-                st.error(f"An error occurred: {str(e)}")
+                st.error(f"Search failed: {str(e)}")
+                return
+    
+    # Show filters and results if available
+    if st.session_state.raw_results:
+        st.session_state.filtered_results = show_results_filters(st.session_state.raw_results)
+        st.markdown(f"**Found {len(st.session_state.raw_results)} results** ({len(st.session_state.filtered_results)} after filtering)")
+        
+        if st.session_state.filtered_results:
+            display_results(st.session_state.filtered_results, base_url)
+            show_pagination(len(st.session_state.filtered_results))
+        else:
+            st.warning("No results match your filters")
 
 if __name__ == "__main__":
     main()
