@@ -11,11 +11,19 @@ import base64
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
 # ========== CONSTANTS ==========
-PROJECT_LIST = ["BCC", "RBOC", "BDATAS", "CSR"]
+PROJECT_LIST = [
+    "BCC", "RBOC", "BDATAS", "CSR", "SELF", "NOD", "BDM", "BBIS", "RTM",
+    "RTMPS", "RTMP", "ASRMT", "EXTSD", "DDP", "CASE", "BISVC", "BAPPS",
+    "BZD", "ENCP", "MCC", "NET", "OMNI2", "OSA", "OTS", "PNP", "BNRPS",
+    "RPCSA", "RPHQ", "SSI"
+]
 TIME_FRAMES = {
     "Last 7 days": 7,
     "Last 30 days": 30,
-    "Last year": 365
+    "Last 90 days": 90,
+    "Last 6 months": 180,
+    "Last year": 365,
+    "All time": None
 }
 
 # ========== SESSION STATE MANAGEMENT ==========
@@ -26,14 +34,20 @@ def init_session_state():
         st.session_state.search_results = None
     if 'auth' not in st.session_state:
         st.session_state.auth = None
+    if 'search_params' not in st.session_state:
+        st.session_state.search_params = {}
 
 # ========== CORE FUNCTIONS ==========
 def search_jira(base_url, auth, query, projects, time_frame):
-    jql = f'text ~ "{query}"'
-    if projects:
-        jql += f' AND project IN ({",".join(projects)})'
-    if time_frame in TIME_FRAMES:
+    jql = f'project IN ({",".join(f"\"{p}\"" for p in PROJECT_LIST)})'
+    
+    if query:
+        jql += f' AND text ~ "{query}"'
+    
+    if time_frame in TIME_FRAMES and TIME_FRAMES[time_frame]:
         jql += f' AND created >= -{TIME_FRAMES[time_frame]}d'
+    
+    jql += ' ORDER BY created DESC'
     
     try:
         response = requests.get(
@@ -41,8 +55,8 @@ def search_jira(base_url, auth, query, projects, time_frame):
             auth=auth,
             params={
                 "jql": jql,
-                "maxResults": 50,
-                "fields": "summary,description,attachment,created,updated"
+                "maxResults": 100,
+                "fields": "summary,description,attachment,created,updated,status,assignee"
             },
             timeout=15
         )
@@ -81,7 +95,6 @@ def show_image_with_zoom(image_base64, filename, key_suffix):
         return
     
     # Create unique keys for each image
-    modal_key = f"modal_{key_suffix}"
     zoom_key = f"zoom_{key_suffix}"
     
     # Check if we should show zoomed view
@@ -110,24 +123,29 @@ def show_search_page():
         username = st.text_input("Username/Email")
         password = st.text_input("Password", type="password")
         
-        query = st.text_input("Search term")
-        projects = st.multiselect("Projects", PROJECT_LIST)
+        query = st.text_input("Search term (leave blank for all issues)")
         time_frame = st.selectbox("Timeframe", list(TIME_FRAMES.keys()))
         search_images = st.checkbox("Search text in images (OCR)", True)
         
         if st.form_submit_button("Search"):
-            if base_url and username and password and query:
+            if base_url and username and password:
                 st.session_state.auth = HTTPBasicAuth(username, password)
+                st.session_state.search_params = {
+                    "search_images": search_images,
+                    "base_url": base_url,
+                    "query": query,
+                    "time_frame": time_frame
+                }
                 with st.spinner("Searching Jira..."):
                     st.session_state.search_results = search_jira(
                         base_url,
                         st.session_state.auth,
                         query,
-                        projects,
+                        PROJECT_LIST,  # Always search all projects
                         time_frame
                     )
             else:
-                st.warning("Please fill all required fields")
+                st.warning("Please provide Jira URL and credentials")
 
 def show_results_page():
     st.title("🔍 Search Results")
@@ -142,12 +160,24 @@ def show_results_page():
     
     st.success(f"Found {len(st.session_state.search_results)} issues")
     auth_token = f"{st.session_state.auth.username}|{st.session_state.auth.password}"
+    search_images = st.session_state.search_params.get("search_images", False)
     
     for issue in st.session_state.search_results:
         with st.expander(f"{issue['key']}: {issue['fields']['summary']}"):
-            st.write(f"**Created:** {issue['fields']['created'][:10]}")
+            # Basic issue info
+            cols = st.columns(3)
+            with cols[0]:
+                st.write(f"**Project:** {issue['key'].split('-')[0]}")
+            with cols[1]:
+                st.write(f"**Created:** {issue['fields']['created'][:10]}")
+            with cols[2]:
+                st.write(f"**Status:** {issue['fields']['status']['name']}")
+            
+            # Description
+            st.write("**Description:**")
             st.write(issue['fields'].get('description', 'No description'))
             
+            # Attachments
             if 'attachment' in issue['fields']:
                 st.subheader("Attachments")
                 for att in issue['fields']['attachment']:
