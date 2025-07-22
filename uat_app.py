@@ -1,4 +1,4 @@
-# app.py - No Secrets Version
+# app.py - Fixed Version (No Secrets)
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
@@ -44,8 +44,13 @@ def search_jira(base_url, auth, query, projects, time_frame):
         return []
 
 @st.cache_data(show_spinner=False)
-def extract_text(image_url, auth):
+def extract_text(image_url, _auth_token):
+    """Modified to take only the auth token string instead of HTTPBasicAuth object"""
     try:
+        # Reconstruct auth object from token string
+        username, password = _auth_token.split("|")
+        auth = HTTPBasicAuth(username, password)
+        
         response = requests.get(image_url, auth=auth, timeout=15)
         img = Image.open(io.BytesIO(response.content))
         return pytesseract.image_to_string(img)
@@ -73,6 +78,7 @@ def main():
     
     if submitted and query and base_url and username and password:
         auth = HTTPBasicAuth(username, password)
+        auth_token = f"{username}|{password}"  # Create hashable token
         
         with st.spinner("Searching Jira..."):
             issues = search_jira(base_url, auth, query, projects, time_frame)
@@ -94,7 +100,8 @@ def main():
                     for att in issue['fields']['attachment']:
                         if att['mimeType'].startswith('image/'):
                             with st.spinner(f"Scanning {att['filename']}..."):
-                                text = extract_text(att['content'], auth)
+                                # Pass the hashable auth token instead of auth object
+                                text = extract_text(att['content'], auth_token)
                                 if query.lower() in text.lower():
                                     cols = st.columns([1, 3])
                                     with cols[0]:
@@ -107,7 +114,7 @@ def main():
                                             file_name=att['filename']
                                         )
                                 elif st.button(f"Run OCR on {att['filename']}"):
-                                    text = extract_text(att['content'], auth)
+                                    text = extract_text(att['content'], auth_token)
                                     st.text_area("OCR Results", text, height=150)
 
 if __name__ == "__main__":
