@@ -43,6 +43,8 @@ def init_session_state():
         st.session_state.available_platforms = []
     if 'page' not in st.session_state:
         st.session_state.page = 1
+    if 'selected_projects' not in st.session_state:
+        st.session_state.selected_projects = PROJECT_LIST.copy()
 
 # ========== CORE FUNCTIONS ==========
 def sanitize_jql(query):
@@ -67,7 +69,7 @@ def search_jira(base_url, auth, query, projects, time_frame, statuses=None, plat
     if time_frame in TIME_FRAMES and TIME_FRAMES[time_frame]:
         jql += f' AND created >= -{TIME_FRAMES[time_frame]}d'
     
-    jql += ' ORDER BY created DESC, project ASC'  # RBOC first due to project ordering
+    jql += ' ORDER BY created DESC, project ASC'
     
     try:
         response = requests.get(
@@ -76,7 +78,7 @@ def search_jira(base_url, auth, query, projects, time_frame, statuses=None, plat
             params={
                 "jql": jql,
                 "maxResults": 200,
-                "fields": "summary,description,attachment,created,updated,status,assignee,project,customfield_12345"  # customfield_12345 for platform
+                "fields": "summary,description,attachment,created,updated,status,assignee,project,customfield_12345"
             },
             timeout=20
         )
@@ -93,7 +95,6 @@ def get_available_filters(issues):
     
     for issue in issues:
         statuses.add(issue['fields']['status']['name'])
-        # Extract platform from custom field if available
         if 'customfield_12345' in issue['fields'] and issue['fields']['customfield_12345']:
             platforms.add(issue['fields']['customfield_12345']['value'])
     
@@ -115,6 +116,14 @@ def extract_text(_auth_token, image_url):
         st.error(f"OCR Error: {str(e)}")
         return ""
 
+def get_image_base64(image_url, auth):
+    try:
+        response = requests.get(image_url, auth=auth, timeout=15)
+        return base64.b64encode(response.content).decode('utf-8')
+    except Exception as e:
+        st.error(f"Image download error: {str(e)}")
+        return None
+
 # ========== UI COMPONENTS ==========
 def show_project_filter():
     col1, col2 = st.columns([4, 1])
@@ -122,15 +131,13 @@ def show_project_filter():
         selected = st.multiselect(
             "Projects",
             PROJECT_LIST,
-            default=st.session_state.search_params.get("selected_projects", PROJECT_LIST)
+            default=st.session_state.selected_projects
         )
     with col2:
         st.write("")
         st.write("")
-        if st.button("All"):
-            selected = PROJECT_LIST
-        if st.button("None"):
-            selected = []
+        if st.radio("Select:", ["All", "None"], key="project_filter"):
+            selected = PROJECT_LIST if st.session_state.project_filter == "All" else []
     return selected
 
 def show_image_with_zoom(image_base64, filename, key_suffix):
@@ -145,8 +152,9 @@ def show_image_with_zoom(image_base64, filename, key_suffix):
             st.session_state[zoom_key] = False
             st.rerun()
     else:
-        if st.image(base64.b64decode(image_base64), width=200, 
-                  caption=f"Click to zoom: {filename}"):
+        st.image(base64.b64decode(image_base64), width=200, 
+               caption=f"Click to zoom: {filename}")
+        if st.button("Zoom", key=f"zoom_btn_{key_suffix}"):
             st.session_state[zoom_key] = True
             st.rerun()
 
@@ -154,6 +162,24 @@ def show_image_with_zoom(image_base64, filename, key_suffix):
 def main():
     st.title("🔍 Jira Search Pro+")
     init_session_state()
+    
+    # Project filter buttons (outside the form)
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        st.session_state.selected_projects = st.multiselect(
+            "Projects",
+            PROJECT_LIST,
+            default=st.session_state.selected_projects
+        )
+    with col2:
+        st.write("")
+        st.write("")
+        if st.button("Select All"):
+            st.session_state.selected_projects = PROJECT_LIST.copy()
+            st.rerun()
+        if st.button("Clear All"):
+            st.session_state.selected_projects = []
+            st.rerun()
     
     # Search Form
     with st.expander("🔍 Search Panel", expanded=True):
@@ -170,7 +196,6 @@ def main():
             
             col1, col2 = st.columns(2)
             with col1:
-                selected_projects = show_project_filter()
                 time_frame = st.selectbox(
                     "Timeframe", 
                     list(TIME_FRAMES.keys()),
@@ -202,17 +227,19 @@ def main():
                 value=st.session_state.search_params.get("search_images", True)
             )
             
-            if st.form_submit_button("Search"):
+            submitted = st.form_submit_button("Search")
+            
+            if submitted:
                 if base_url and username and password:
                     st.session_state.auth = HTTPBasicAuth(username, password)
-                    st.session_state.page = 1  # Reset to first page
+                    st.session_state.page = 1
                     
                     with st.spinner("Searching Jira..."):
                         results = search_jira(
                             base_url,
                             st.session_state.auth,
                             query,
-                            selected_projects,
+                            st.session_state.selected_projects,
                             time_frame,
                             selected_statuses,
                             selected_platform if selected_platform else None
@@ -224,11 +251,9 @@ def main():
                             st.session_state.available_statuses = filters['statuses']
                             st.session_state.available_platforms = filters['platforms']
                             
-                            # Store search parameters
                             st.session_state.search_params = {
                                 "base_url": base_url,
                                 "query": query,
-                                "selected_projects": selected_projects,
                                 "time_frame": time_frame,
                                 "selected_statuses": selected_statuses,
                                 "search_images": search_images,
@@ -242,14 +267,12 @@ def main():
 
     # Results Display
     if st.session_state.search_results:
-        # Filter results
         filtered_results = [
             issue for issue in st.session_state.search_results 
             if (not st.session_state.search_params.get("selected_statuses") or 
                 issue['fields']['status']['name'] in st.session_state.search_params["selected_statuses"])
         ]
         
-        # Pagination
         RESULTS_PER_PAGE = 10
         total_pages = (len(filtered_results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
         start_idx = (st.session_state.page - 1) * RESULTS_PER_PAGE
@@ -257,7 +280,6 @@ def main():
         
         st.success(f"Found {len(st.session_state.search_results)} issues ({len(filtered_results)} after filtering)")
         
-        # Show platform filter if available
         if st.session_state.available_platforms:
             platform = st.selectbox(
                 "Filter by Platform", 
@@ -271,7 +293,6 @@ def main():
                        issue['fields']['customfield_12345']['value'] == platform
                 ]
         
-        # Display paginated results
         for issue in filtered_results[start_idx:end_idx]:
             with st.expander(f"{issue['key']}: {issue['fields']['summary']}", expanded=True):
                 cols = st.columns([3, 1])
@@ -292,7 +313,6 @@ def main():
                     st.write("**Description:**")
                     st.write(issue['fields'].get('description', 'No description')[:500] + ("..." if len(issue['fields'].get('description', '')) > 500 else ""))
                 
-                # Attachments handling
                 if 'attachment' in issue['fields']:
                     st.subheader("Attachments")
                     for att in issue['fields']['attachment']:
@@ -315,7 +335,6 @@ def main():
                                         file_name=att['filename']
                                     )
         
-        # Pagination controls
         if total_pages > 1:
             st.write("---")
             col1, col2, col3 = st.columns([1, 2, 1])
