@@ -5,13 +5,15 @@ from PIL import Image
 import pytesseract
 import io
 import base64
+import re
+from datetime import datetime, timedelta, timezone
 
 # Configure Tesseract path for Streamlit Cloud
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
 # ========== CONSTANTS ==========
 PROJECT_LIST = [
-    "BCC", "RBOC", "BDATAS", "CSR", "SELF", "NOD", "BDM", "BBIS", "RTM",
+    "RBOC", "BCC", "BDATAS", "CSR", "SELF", "NOD", "BDM", "BBIS", "RTM",
     "RTMPS", "RTMP", "ASRMT", "EXTSD", "DDP", "CASE", "BISVC", "BAPPS",
     "BZD", "ENCP", "MCC", "NET", "OMNI2", "OSA", "OTS", "PNP", "BNRPS",
     "RPCSA", "RPHQ", "SSI"
@@ -37,21 +39,35 @@ def init_session_state():
         st.session_state.search_params = {}
     if 'available_statuses' not in st.session_state:
         st.session_state.available_statuses = []
+    if 'available_platforms' not in st.session_state:
+        st.session_state.available_platforms = []
+    if 'page' not in st.session_state:
+        st.session_state.page = 1
 
 # ========== CORE FUNCTIONS ==========
-def search_jira(base_url, auth, query, projects, time_frame, statuses=None):
+def sanitize_jql(query):
+    """Handle special characters in JQL queries"""
+    if '"' in query:
+        query = query.replace('"', '\\"')
+    return query
+
+def search_jira(base_url, auth, query, projects, time_frame, statuses=None, platform=None):
     jql = f'project IN ({",".join(f"\"{p}\"" for p in projects)})'
     
     if query:
-        jql += f' AND text ~ "{query}"'
+        sanitized_query = sanitize_jql(query)
+        jql += f' AND (text ~ "{sanitized_query}" OR attachmentContent ~ "{sanitized_query}")'
     
     if statuses:
         jql += f' AND status IN ({",".join(f"\"{s}\"" for s in statuses)})'
     
+    if platform:
+        jql += f' AND "Platform" ~ "{platform}"'
+    
     if time_frame in TIME_FRAMES and TIME_FRAMES[time_frame]:
         jql += f' AND created >= -{TIME_FRAMES[time_frame]}d'
     
-    jql += ' ORDER BY created DESC'
+    jql += ' ORDER BY created DESC, project ASC'  # RBOC first due to project ordering
     
     try:
         response = requests.get(
@@ -59,10 +75,10 @@ def search_jira(base_url, auth, query, projects, time_frame, statuses=None):
             auth=auth,
             params={
                 "jql": jql,
-                "maxResults": 100,
-                "fields": "summary,description,attachment,created,updated,status,assignee,project"
+                "maxResults": 200,
+                "fields": "summary,description,attachment,created,updated,status,assignee,project,customfield_12345"  # customfield_12345 for platform
             },
-            timeout=15
+            timeout=20
         )
         response.raise_for_status()
         return response.json().get("issues", [])
@@ -70,12 +86,21 @@ def search_jira(base_url, auth, query, projects, time_frame, statuses=None):
         st.error(f"Jira API Error: {str(e)}")
         return []
 
-def get_available_statuses(issues):
-    """Extract unique statuses from search results"""
+def get_available_filters(issues):
+    """Extract unique statuses and platforms from search results"""
     statuses = set()
+    platforms = set()
+    
     for issue in issues:
         statuses.add(issue['fields']['status']['name'])
-    return sorted(statuses)
+        # Extract platform from custom field if available
+        if 'customfield_12345' in issue['fields'] and issue['fields']['customfield_12345']:
+            platforms.add(issue['fields']['customfield_12345']['value'])
+    
+    return {
+        'statuses': sorted(statuses),
+        'platforms': sorted(platforms)
+    }
 
 @st.cache_data(show_spinner=False)
 def extract_text(_auth_token, image_url):
@@ -90,227 +115,220 @@ def extract_text(_auth_token, image_url):
         st.error(f"OCR Error: {str(e)}")
         return ""
 
-# ========== IMAGE HANDLING ==========
-def get_image_base64(image_url, auth):
-    """Get base64 encoded image with error handling"""
-    try:
-        response = requests.get(image_url, auth=auth, timeout=10)
-        return base64.b64encode(response.content).decode("utf-8")
-    except Exception as e:
-        st.error(f"Failed to load image: {str(e)}")
-        return None
+# ========== UI COMPONENTS ==========
+def show_project_filter():
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        selected = st.multiselect(
+            "Projects",
+            PROJECT_LIST,
+            default=st.session_state.search_params.get("selected_projects", PROJECT_LIST)
+        )
+    with col2:
+        st.write("")
+        st.write("")
+        if st.button("All"):
+            selected = PROJECT_LIST
+        if st.button("None"):
+            selected = []
+    return selected
 
 def show_image_with_zoom(image_base64, filename, key_suffix):
-    """Display image with reliable zoom functionality"""
     if not image_base64:
         return
     
-    # Create unique keys for each image
     zoom_key = f"zoom_{key_suffix}"
     
-    # Check if we should show zoomed view
     if st.session_state.get(zoom_key, False):
-        # Display the zoomed image with a close button
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            if st.button("◄ Back", key=f"back_{key_suffix}"):
-                st.session_state[zoom_key] = False
-                st.rerun()
-        with col2:
-            st.image(base64.b64decode(image_base64), use_container_width=True)
+        st.image(base64.b64decode(image_base64), use_container_width=True)
+        if st.button("◄ Back", key=f"back_{key_suffix}"):
+            st.session_state[zoom_key] = False
+            st.rerun()
     else:
-        # Display thumbnail that can be clicked to zoom
         if st.image(base64.b64decode(image_base64), width=200, 
-                   caption=f"Click to zoom: {filename}"):
+                  caption=f"Click to zoom: {filename}"):
             st.session_state[zoom_key] = True
             st.rerun()
 
 # ========== MAIN UI ==========
 def main():
-    st.title("🔍 Jira Search with OCR")
+    st.title("🔍 Jira Search Pro+")
     init_session_state()
     
-    # Search Form (always visible)
-    with st.form("search_form"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
+    # Search Form
+    with st.expander("🔍 Search Panel", expanded=True):
+        with st.form("search_form"):
             base_url = st.text_input(
                 "Jira URL", 
                 value=st.session_state.search_params.get("base_url", ""),
                 placeholder="https://your-domain.atlassian.net"
             )
-            username = st.text_input(
-                "Username/Email", 
-                value=st.session_state.search_params.get("username", "")
-            )
-            password = st.text_input(
-                "Password", 
-                type="password",
-                value=st.session_state.search_params.get("password", "")
-            )
+            username = st.text_input("Username/Email")
+            password = st.text_input("Password", type="password")
             
-            query = st.text_input(
-                "Search term", 
-                value=st.session_state.search_params.get("query", "")
-            )
-        
-        with col2:
-            selected_projects = st.multiselect(
-                "Projects",
-                PROJECT_LIST,
-                default=st.session_state.search_params.get("selected_projects", PROJECT_LIST)
-            )
+            query = st.text_input("Search term", value=st.session_state.search_params.get("query", ""))
             
-            time_frame = st.selectbox(
-                "Timeframe", 
-                list(TIME_FRAMES.keys()),
-                index=list(TIME_FRAMES.keys()).index(
-                    st.session_state.search_params.get("time_frame", "Last 7 days")
+            col1, col2 = st.columns(2)
+            with col1:
+                selected_projects = show_project_filter()
+                time_frame = st.selectbox(
+                    "Timeframe", 
+                    list(TIME_FRAMES.keys()),
+                    index=list(TIME_FRAMES.keys()).index(
+                        st.session_state.search_params.get("time_frame", "Last 7 days")
+                    )
                 )
-            )
-            
-            if st.session_state.available_statuses:
-                selected_statuses = st.multiselect(
-                    "Statuses",
-                    st.session_state.available_statuses,
-                    default=st.session_state.search_params.get("selected_statuses", st.session_state.available_statuses)
-                )
-            else:
-                selected_statuses = []
+            with col2:
+                if st.session_state.available_statuses:
+                    selected_statuses = st.multiselect(
+                        "Statuses",
+                        st.session_state.available_statuses,
+                        default=st.session_state.search_params.get("selected_statuses", st.session_state.available_statuses)
+                    )
+                else:
+                    selected_statuses = []
+                
+                if st.session_state.available_platforms:
+                    selected_platform = st.selectbox(
+                        "Platform", 
+                        [""] + st.session_state.available_platforms,
+                        index=0
+                    )
+                else:
+                    selected_platform = ""
             
             search_images = st.checkbox(
                 "Search text in images (OCR)",
                 value=st.session_state.search_params.get("search_images", True)
             )
-        
-        # Form submission buttons
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            search_btn = st.form_submit_button("🔍 Search")
-        with col2:
-            clear_btn = st.form_submit_button("🔄 Clear Filters")
-        with col3:
-            reset_btn = st.form_submit_button("🔄 Reset Session")
-        
-        if search_btn or clear_btn or reset_btn:
-            if reset_btn:
-                # Complete reset
-                st.session_state.search_results = None
-                st.session_state.search_params = {}
-                st.session_state.available_statuses = []
-                st.rerun()
-            elif clear_btn:
-                # Just clear filters
-                st.session_state.search_params["query"] = ""
-                st.session_state.search_params["selected_projects"] = PROJECT_LIST
-                st.session_state.search_params["time_frame"] = "Last 7 days"
-                if st.session_state.available_statuses:
-                    st.session_state.search_params["selected_statuses"] = st.session_state.available_statuses.copy()
-                st.rerun()
-            elif base_url and username and password:
-                # Perform search
-                st.session_state.auth = HTTPBasicAuth(username, password)
-                st.session_state.search_params = {
-                    "base_url": base_url,
-                    "username": username,
-                    "password": password,
-                    "query": query,
-                    "selected_projects": selected_projects,
-                    "time_frame": time_frame,
-                    "selected_statuses": selected_statuses,
-                    "search_images": search_images
-                }
-                
-                with st.spinner("Searching Jira..."):
-                    results = search_jira(
-                        base_url,
-                        st.session_state.auth,
-                        query,
-                        selected_projects,
-                        time_frame,
-                        selected_statuses
-                    )
+            
+            if st.form_submit_button("Search"):
+                if base_url and username and password:
+                    st.session_state.auth = HTTPBasicAuth(username, password)
+                    st.session_state.page = 1  # Reset to first page
                     
-                    if results:
-                        st.session_state.search_results = results
-                        st.session_state.available_statuses = get_available_statuses(results)
-                        # Auto-select all statuses when getting new results
-                        st.session_state.search_params["selected_statuses"] = st.session_state.available_statuses.copy()
-                    else:
-                        st.session_state.search_results = None
-                        st.warning("No results found")
+                    with st.spinner("Searching Jira..."):
+                        results = search_jira(
+                            base_url,
+                            st.session_state.auth,
+                            query,
+                            selected_projects,
+                            time_frame,
+                            selected_statuses,
+                            selected_platform if selected_platform else None
+                        )
+                        
+                        if results:
+                            st.session_state.search_results = results
+                            filters = get_available_filters(results)
+                            st.session_state.available_statuses = filters['statuses']
+                            st.session_state.available_platforms = filters['platforms']
+                            
+                            # Store search parameters
+                            st.session_state.search_params = {
+                                "base_url": base_url,
+                                "query": query,
+                                "selected_projects": selected_projects,
+                                "time_frame": time_frame,
+                                "selected_statuses": selected_statuses,
+                                "search_images": search_images,
+                                "platform": selected_platform
+                            }
+                        else:
+                            st.session_state.search_results = None
+                            st.warning("No results found")
+                else:
+                    st.warning("Please provide Jira URL and credentials")
 
-    # Results Display (on same page)
+    # Results Display
     if st.session_state.search_results:
-        st.success(f"Found {len(st.session_state.search_results)} issues")
+        # Filter results
+        filtered_results = [
+            issue for issue in st.session_state.search_results 
+            if (not st.session_state.search_params.get("selected_statuses") or 
+                issue['fields']['status']['name'] in st.session_state.search_params["selected_statuses"])
+        ]
         
-        # Filter results by status if needed
-        filtered_results = st.session_state.search_results
-        if st.session_state.search_params.get("selected_statuses"):
-            filtered_results = [
-                issue for issue in filtered_results 
-                if issue['fields']['status']['name'] in st.session_state.search_params["selected_statuses"]
-            ]
-        st.info(f"Showing {len(filtered_results)} matches after filtering")
+        # Pagination
+        RESULTS_PER_PAGE = 10
+        total_pages = (len(filtered_results) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE
+        start_idx = (st.session_state.page - 1) * RESULTS_PER_PAGE
+        end_idx = start_idx + RESULTS_PER_PAGE
         
-        for issue in filtered_results:
-            with st.expander(f"{issue['key']}: {issue['fields']['summary']}"):
-                # Basic issue info
-                cols = st.columns(3)
+        st.success(f"Found {len(st.session_state.search_results)} issues ({len(filtered_results)} after filtering)")
+        
+        # Show platform filter if available
+        if st.session_state.available_platforms:
+            platform = st.selectbox(
+                "Filter by Platform", 
+                ["All Platforms"] + st.session_state.available_platforms
+            )
+            if platform != "All Platforms":
+                filtered_results = [
+                    issue for issue in filtered_results 
+                    if 'customfield_12345' in issue['fields'] and 
+                       issue['fields']['customfield_12345'] and 
+                       issue['fields']['customfield_12345']['value'] == platform
+                ]
+        
+        # Display paginated results
+        for issue in filtered_results[start_idx:end_idx]:
+            with st.expander(f"{issue['key']}: {issue['fields']['summary']}", expanded=True):
+                cols = st.columns([3, 1])
                 with cols[0]:
                     st.write(f"**Project:** {issue['key'].split('-')[0]}")
-                with cols[1]:
                     st.write(f"**Created:** {issue['fields']['created'][:10]}")
-                with cols[2]:
+                    
                     status = issue['fields']['status']['name']
                     color = "green" if status == "Done" else "orange" if status == "In Progress" else "gray"
-                    st.markdown(f"**Status:** <span style='color:{color}'>{status}</span>", 
-                               unsafe_allow_html=True)
+                    st.markdown(f"**Status:** <span style='color:{color}'>{status}</span>", unsafe_allow_html=True)
+                    
+                    if 'customfield_12345' in issue['fields'] and issue['fields']['customfield_12345']:
+                        st.write(f"**Platform:** {issue['fields']['customfield_12345']['value']}")
+                    
+                    st.markdown(f"[Open in Jira ↗]({base_url}/browse/{issue['key']})", unsafe_allow_html=True)
                 
-                # Description
-                st.write("**Description:**")
-                st.write(issue['fields'].get('description', 'No description'))
+                with cols[1]:
+                    st.write("**Description:**")
+                    st.write(issue['fields'].get('description', 'No description')[:500] + ("..." if len(issue['fields'].get('description', '')) > 500 else ""))
                 
-                # Attachments
+                # Attachments handling
                 if 'attachment' in issue['fields']:
                     st.subheader("Attachments")
                     for att in issue['fields']['attachment']:
                         if att['mimeType'].startswith('image/'):
                             with st.container(border=True):
-                                st.write(f"**{att['filename']}**")
-                                
-                                # Get image data
                                 image_base64 = get_image_base64(att['content'], st.session_state.auth)
-                                
-                                # Display image with zoom
                                 if image_base64:
-                                    show_image_with_zoom(
-                                        image_base64, 
-                                        att['filename'],
-                                        att['id']  # Unique key suffix
-                                    )
-                                
-                                # OCR functionality
-                                if st.session_state.search_params.get("search_images", False):
-                                    if st.button(f"Run OCR on {att['filename']}", 
-                                               key=f"ocr_{att['id']}"):
-                                        with st.spinner("Extracting text..."):
-                                            auth_token = f"{st.session_state.auth.username}|{st.session_state.auth.password}"
-                                            text = extract_text(auth_token, att['content'])
-                                            st.text_area("Extracted Text", 
-                                                        text, 
-                                                        height=150,
-                                                        key=f"text_{att['id']}")
-                                
-                                # Download button
-                                if image_base64:
+                                    show_image_with_zoom(image_base64, att['filename'], att['id'])
+                                    
+                                    if st.session_state.search_params.get("search_images", False):
+                                        if st.button(f"Run OCR on {att['filename']}", key=f"ocr_{att['id']}"):
+                                            with st.spinner("Extracting text..."):
+                                                auth_token = f"{username}|{password}"
+                                                text = extract_text(auth_token, att['content'])
+                                                st.text_area("Extracted Text", text, height=150)
+                                    
                                     st.download_button(
                                         f"Download {att['filename']}",
                                         data=base64.b64decode(image_base64),
-                                        file_name=att['filename'],
-                                        key=f"dl_{att['id']}"
+                                        file_name=att['filename']
                                     )
+        
+        # Pagination controls
+        if total_pages > 1:
+            st.write("---")
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col1:
+                if st.button("◀ Previous") and st.session_state.page > 1:
+                    st.session_state.page -= 1
+                    st.rerun()
+            with col2:
+                st.markdown(f"**Page {st.session_state.page} of {total_pages}**", unsafe_allow_html=True)
+            with col3:
+                if st.button("Next ▶") and st.session_state.page < total_pages:
+                    st.session_state.page += 1
+                    st.rerun()
 
 if __name__ == "__main__":
     main()
