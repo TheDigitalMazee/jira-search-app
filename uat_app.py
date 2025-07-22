@@ -37,13 +37,18 @@ def init_session_state():
         st.session_state.search_params = {}
     if 'selected_projects' not in st.session_state:
         st.session_state.selected_projects = PROJECT_LIST.copy()
+    if 'selected_statuses' not in st.session_state:
+        st.session_state.selected_statuses = []
 
 # ========== CORE FUNCTIONS ==========
-def search_jira(base_url, auth, query, projects, time_frame):
+def search_jira(base_url, auth, query, projects, time_frame, statuses=None):
     jql = f'project IN ({",".join(f"\"{p}\"" for p in projects)})'
     
     if query:
         jql += f' AND text ~ "{query}"'
+    
+    if statuses:
+        jql += f' AND status IN ({",".join(f"\"{s}\"" for s in statuses)})'
     
     if time_frame in TIME_FRAMES and TIME_FRAMES[time_frame]:
         jql += f' AND created >= -{TIME_FRAMES[time_frame]}d'
@@ -66,6 +71,13 @@ def search_jira(base_url, auth, query, projects, time_frame):
     except Exception as e:
         st.error(f"Jira API Error: {str(e)}")
         return []
+
+def get_available_statuses(issues):
+    """Extract unique statuses from search results"""
+    statuses = set()
+    for issue in issues:
+        statuses.add(issue['fields']['status']['name'])
+    return sorted(statuses)
 
 @st.cache_data(show_spinner=False)
 def extract_text(_auth_token, image_url):
@@ -141,7 +153,8 @@ def show_search_page():
                     "base_url": base_url,
                     "query": query,
                     "time_frame": time_frame,
-                    "selected_projects": st.session_state.selected_projects
+                    "selected_projects": st.session_state.selected_projects,
+                    "selected_statuses": []  # Initialize empty, will populate after first search
                 }
                 with st.spinner("Searching Jira..."):
                     st.session_state.search_results = search_jira(
@@ -151,6 +164,12 @@ def show_search_page():
                         st.session_state.selected_projects,
                         time_frame
                     )
+                    # Initialize status filters after first search
+                    if st.session_state.search_results:
+                        st.session_state.available_statuses = get_available_statuses(
+                            st.session_state.search_results
+                        )
+                        st.session_state.selected_statuses = st.session_state.available_statuses.copy()
             else:
                 st.warning("Please provide Jira URL and credentials")
 
@@ -164,22 +183,35 @@ def show_results_page():
                 "Search term", 
                 value=st.session_state.search_params.get("query", "")
             )
-            new_selected_projects = st.multiselect(
-                "Projects",
-                PROJECT_LIST,
-                default=st.session_state.search_params.get("selected_projects", PROJECT_LIST)
-            )
-            new_time_frame = st.selectbox(
-                "Timeframe", 
-                list(TIME_FRAMES.keys()),
-                index=list(TIME_FRAMES.keys()).index(
-                    st.session_state.search_params.get("time_frame", "Last 7 days")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                new_selected_projects = st.multiselect(
+                    "Projects",
+                    PROJECT_LIST,
+                    default=st.session_state.search_params.get("selected_projects", PROJECT_LIST)
                 )
-            )
-            new_search_images = st.checkbox(
-                "Search text in images (OCR)",
-                value=st.session_state.search_params.get("search_images", True)
-            )
+                new_time_frame = st.selectbox(
+                    "Timeframe", 
+                    list(TIME_FRAMES.keys()),
+                    index=list(TIME_FRAMES.keys()).index(
+                        st.session_state.search_params.get("time_frame", "Last 7 days")
+                    )
+                )
+            with col2:
+                if hasattr(st.session_state, 'available_statuses'):
+                    new_selected_statuses = st.multiselect(
+                        "Statuses",
+                        st.session_state.available_statuses,
+                        default=st.session_state.get('selected_statuses', [])
+                    )
+                else:
+                    new_selected_statuses = []
+                
+                new_search_images = st.checkbox(
+                    "Search text in images (OCR)",
+                    value=st.session_state.search_params.get("search_images", True)
+                )
             
             if st.form_submit_button("Refine Search"):
                 st.session_state.search_params = {
@@ -187,15 +219,19 @@ def show_results_page():
                     "base_url": st.session_state.search_params["base_url"],
                     "query": new_query,
                     "time_frame": new_time_frame,
-                    "selected_projects": new_selected_projects
+                    "selected_projects": new_selected_projects,
+                    "selected_statuses": new_selected_statuses
                 }
+                st.session_state.selected_statuses = new_selected_statuses
+                
                 with st.spinner("Searching Jira..."):
                     st.session_state.search_results = search_jira(
                         st.session_state.search_params["base_url"],
                         st.session_state.auth,
                         new_query,
                         new_selected_projects,
-                        new_time_frame
+                        new_time_frame,
+                        new_selected_statuses
                     )
                 st.rerun()
     
@@ -203,11 +239,20 @@ def show_results_page():
         st.warning("No results to display")
         return
     
-    st.success(f"Found {len(st.session_state.search_results)} issues")
+    # Filter results by status if needed (client-side filtering as fallback)
+    filtered_results = st.session_state.search_results
+    if hasattr(st.session_state, 'selected_statuses') and st.session_state.selected_statuses:
+        filtered_results = [
+            issue for issue in filtered_results 
+            if issue['fields']['status']['name'] in st.session_state.selected_statuses
+        ]
+    
+    st.success(f"Showing {len(filtered_results)} of {len(st.session_state.search_results)} issues")
+    
     auth_token = f"{st.session_state.auth.username}|{st.session_state.auth.password}"
     search_images = st.session_state.search_params.get("search_images", False)
     
-    for issue in st.session_state.search_results:
+    for issue in filtered_results:
         with st.expander(f"{issue['key']}: {issue['fields']['summary']}"):
             # Basic issue info
             cols = st.columns(3)
@@ -216,7 +261,10 @@ def show_results_page():
             with cols[1]:
                 st.write(f"**Created:** {issue['fields']['created'][:10]}")
             with cols[2]:
-                st.write(f"**Status:** {issue['fields']['status']['name']}")
+                status = issue['fields']['status']['name']
+                color = "green" if status == "Done" else "orange" if status == "In Progress" else "gray"
+                st.markdown(f"**Status:** <span style='color:{color}'>{status}</span>", 
+                           unsafe_allow_html=True)
             
             # Description
             st.write("**Description:**")
