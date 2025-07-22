@@ -5,3 +5,5 @@ torch>=1.13.1
 pymupdf>=1.23.5
 pillow>=10.1.0
 pytesseract>=0.3.10
+python-dotenv>=1.0.0
+tesserocr>=2.5.2  # Cloud-compatible OCR
