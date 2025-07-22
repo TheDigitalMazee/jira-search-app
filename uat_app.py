@@ -4,7 +4,6 @@ import streamlit as st
 from PIL import Image
 import pytesseract
 import io
-from datetime import datetime, timedelta, timezone
 import base64
 
 # Configure Tesseract path for Streamlit Cloud
@@ -36,10 +35,12 @@ def init_session_state():
         st.session_state.auth = None
     if 'search_params' not in st.session_state:
         st.session_state.search_params = {}
+    if 'selected_projects' not in st.session_state:
+        st.session_state.selected_projects = PROJECT_LIST.copy()
 
 # ========== CORE FUNCTIONS ==========
 def search_jira(base_url, auth, query, projects, time_frame):
-    jql = f'project IN ({",".join(f"\"{p}\"" for p in PROJECT_LIST)})'
+    jql = f'project IN ({",".join(f"\"{p}\"" for p in projects)})'
     
     if query:
         jql += f' AND text ~ "{query}"'
@@ -56,7 +57,7 @@ def search_jira(base_url, auth, query, projects, time_frame):
             params={
                 "jql": jql,
                 "maxResults": 100,
-                "fields": "summary,description,attachment,created,updated,status,assignee"
+                "fields": "summary,description,attachment,created,updated,status,assignee,project"
             },
             timeout=15
         )
@@ -106,7 +107,7 @@ def show_image_with_zoom(image_base64, filename, key_suffix):
                 st.session_state[zoom_key] = False
                 st.rerun()
         with col2:
-            st.image(base64.b64decode(image_base64), use_column_width=True)
+            st.image(base64.b64decode(image_base64), use_container_width=True)
     else:
         # Display thumbnail that can be clicked to zoom
         if st.image(base64.b64decode(image_base64), width=200, 
@@ -124,6 +125,11 @@ def show_search_page():
         password = st.text_input("Password", type="password")
         
         query = st.text_input("Search term (leave blank for all issues)")
+        st.session_state.selected_projects = st.multiselect(
+            "Projects to search",
+            PROJECT_LIST,
+            default=st.session_state.get('selected_projects', PROJECT_LIST)
+        )
         time_frame = st.selectbox("Timeframe", list(TIME_FRAMES.keys()))
         search_images = st.checkbox("Search text in images (OCR)", True)
         
@@ -134,14 +140,15 @@ def show_search_page():
                     "search_images": search_images,
                     "base_url": base_url,
                     "query": query,
-                    "time_frame": time_frame
+                    "time_frame": time_frame,
+                    "selected_projects": st.session_state.selected_projects
                 }
                 with st.spinner("Searching Jira..."):
                     st.session_state.search_results = search_jira(
                         base_url,
                         st.session_state.auth,
                         query,
-                        PROJECT_LIST,  # Always search all projects
+                        st.session_state.selected_projects,
                         time_frame
                     )
             else:
@@ -150,9 +157,47 @@ def show_search_page():
 def show_results_page():
     st.title("🔍 Search Results")
     
-    if st.button("◄ Back to Search"):
-        st.session_state.search_results = None
-        st.rerun()
+    # Keep the search form visible on results page
+    with st.expander("🔍 Modify Search", expanded=True):
+        with st.form("refine_search"):
+            new_query = st.text_input(
+                "Search term", 
+                value=st.session_state.search_params.get("query", "")
+            )
+            new_selected_projects = st.multiselect(
+                "Projects",
+                PROJECT_LIST,
+                default=st.session_state.search_params.get("selected_projects", PROJECT_LIST)
+            )
+            new_time_frame = st.selectbox(
+                "Timeframe", 
+                list(TIME_FRAMES.keys()),
+                index=list(TIME_FRAMES.keys()).index(
+                    st.session_state.search_params.get("time_frame", "Last 7 days")
+                )
+            )
+            new_search_images = st.checkbox(
+                "Search text in images (OCR)",
+                value=st.session_state.search_params.get("search_images", True)
+            )
+            
+            if st.form_submit_button("Refine Search"):
+                st.session_state.search_params = {
+                    "search_images": new_search_images,
+                    "base_url": st.session_state.search_params["base_url"],
+                    "query": new_query,
+                    "time_frame": new_time_frame,
+                    "selected_projects": new_selected_projects
+                }
+                with st.spinner("Searching Jira..."):
+                    st.session_state.search_results = search_jira(
+                        st.session_state.search_params["base_url"],
+                        st.session_state.auth,
+                        new_query,
+                        new_selected_projects,
+                        new_time_frame
+                    )
+                st.rerun()
     
     if not st.session_state.search_results:
         st.warning("No results to display")
