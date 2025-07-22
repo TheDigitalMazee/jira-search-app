@@ -1,4 +1,4 @@
-import os
+# app.py - No Secrets Version
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
@@ -6,7 +6,6 @@ from PIL import Image
 import pytesseract
 import io
 from datetime import datetime, timedelta, timezone
-import base64
 
 # Configure Tesseract path for Streamlit Cloud
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
@@ -20,37 +19,33 @@ TIME_FRAMES = {
 }
 
 # ========== CORE FUNCTIONS ==========
-@st.cache_data(ttl=3600)
-def search_jira(query, projects, time_frame):
-    auth = HTTPBasicAuth(
-        os.environ["JIRA_USER"],
-        os.environ["JIRA_TOKEN"]
-    )
-    
+def search_jira(base_url, auth, query, projects, time_frame):
     jql = f'text ~ "{query}"'
     if projects:
         jql += f' AND project IN ({",".join(projects)})'
     if time_frame in TIME_FRAMES:
         jql += f' AND created >= -{TIME_FRAMES[time_frame]}d'
     
-    response = requests.get(
-        f"{os.environ['JIRA_URL']}/rest/api/2/search",
-        auth=auth,
-        params={
-            "jql": jql,
-            "maxResults": 50,
-            "fields": "summary,description,attachment,created,updated"
-        }
-    )
-    return response.json().get("issues", [])
+    try:
+        response = requests.get(
+            f"{base_url}/rest/api/2/search",
+            auth=auth,
+            params={
+                "jql": jql,
+                "maxResults": 50,
+                "fields": "summary,description,attachment,created,updated"
+            },
+            timeout=15
+        )
+        response.raise_for_status()
+        return response.json().get("issues", [])
+    except Exception as e:
+        st.error(f"Jira API Error: {str(e)}")
+        return []
 
 @st.cache_data(show_spinner=False)
-def extract_text(image_url):
+def extract_text(image_url, auth):
     try:
-        auth = HTTPBasicAuth(
-            os.environ["JIRA_USER"],
-            os.environ["JIRA_TOKEN"]
-        )
         response = requests.get(image_url, auth=auth, timeout=15)
         img = Image.open(io.BytesIO(response.content))
         return pytesseract.image_to_string(img)
@@ -60,7 +55,13 @@ def extract_text(image_url):
 
 # ========== STREAMLIT UI ==========
 def main():
-    st.title("🔍 Cloud Jira Search with OCR")
+    st.title("🔍 Jira Search with OCR (No Secrets)")
+    
+    # Credential Input
+    with st.expander("🔑 Jira Credentials", expanded=True):
+        base_url = st.text_input("Jira URL", placeholder="https://your-domain.atlassian.net")
+        username = st.text_input("Username/Email")
+        password = st.text_input("Password", type="password")
     
     # Search Form
     with st.form("search_form"):
@@ -70,9 +71,11 @@ def main():
         search_images = st.checkbox("Search text in images (OCR)", True)
         submitted = st.form_submit_button("Search")
     
-    if submitted and query:
+    if submitted and query and base_url and username and password:
+        auth = HTTPBasicAuth(username, password)
+        
         with st.spinner("Searching Jira..."):
-            issues = search_jira(query, projects, time_frame)
+            issues = search_jira(base_url, auth, query, projects, time_frame)
             
         if not issues:
             st.warning("No issues found")
@@ -91,7 +94,7 @@ def main():
                     for att in issue['fields']['attachment']:
                         if att['mimeType'].startswith('image/'):
                             with st.spinner(f"Scanning {att['filename']}..."):
-                                text = extract_text(att['content'])
+                                text = extract_text(att['content'], auth)
                                 if query.lower() in text.lower():
                                     cols = st.columns([1, 3])
                                     with cols[0]:
@@ -100,15 +103,12 @@ def main():
                                         st.text_area("Extracted Text", text, height=150)
                                         st.download_button(
                                             "Download Image",
-                                            data=requests.get(att['content']).content,
+                                            data=requests.get(att['content'], auth=auth).content,
                                             file_name=att['filename']
                                         )
+                                elif st.button(f"Run OCR on {att['filename']}"):
+                                    text = extract_text(att['content'], auth)
+                                    st.text_area("OCR Results", text, height=150)
 
 if __name__ == "__main__":
-    # Verify required environment variables
-    required_vars = ["JIRA_URL", "JIRA_USER", "JIRA_TOKEN"]
-    if not all(var in os.environ for var in required_vars):
-        st.error("Missing environment variables. Please configure in Secrets.")
-        st.stop()
-    
     main()
