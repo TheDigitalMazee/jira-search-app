@@ -1,4 +1,4 @@
-# app.py - Fixed Version (No Secrets)
+# app.py - Enhanced with Image Zoom and Better Error Handling
 import requests
 from requests.auth import HTTPBasicAuth
 import streamlit as st
@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
 # ========== CONSTANTS ==========
-PROJECT_LIST = ["BCC", "RBOC", "BDATAS", "CSR"]  # Your projects
+PROJECT_LIST = ["BCC", "RBOC", "BDATAS", "CSR"]
 TIME_FRAMES = {
     "Last 7 days": 7,
     "Last 30 days": 30,
@@ -45,9 +45,7 @@ def search_jira(base_url, auth, query, projects, time_frame):
 
 @st.cache_data(show_spinner=False)
 def extract_text(image_url, _auth_token):
-    """Modified to take only the auth token string instead of HTTPBasicAuth object"""
     try:
-        # Reconstruct auth object from token string
         username, password = _auth_token.split("|")
         auth = HTTPBasicAuth(username, password)
         
@@ -59,8 +57,34 @@ def extract_text(image_url, _auth_token):
         return ""
 
 # ========== STREAMLIT UI ==========
+def show_image_zoomable(image_url, auth, width=200):
+    """Displays a clickable/zoomable image"""
+    try:
+        response = requests.get(image_url, auth=auth, timeout=10)
+        img = Image.open(io.BytesIO(response.content))
+        
+        # Create two columns - one for thumbnail, one for zoomed view
+        col1, col2 = st.columns([1, 3])
+        
+        with col1:
+            # Clickable thumbnail
+            clicked = st.image(img, width=width, caption="Click to enlarge")
+            
+        with col2:
+            # Only show zoomed view if thumbnail is clicked
+            if st.session_state.get(f"zoom_{image_url}", False):
+                st.image(img, caption="Zoomed View")
+                if st.button("Close Zoom", key=f"close_{image_url}"):
+                    st.session_state[f"zoom_{image_url}"] = False
+            elif clicked:  # If thumbnail is clicked
+                st.session_state[f"zoom_{image_url}"] = True
+                st.rerun()
+                
+    except Exception as e:
+        st.error(f"Failed to load image: {str(e)}")
+
 def main():
-    st.title("🔍 Jira Search with OCR (No Secrets)")
+    st.title("🔍 Jira Search with OCR ")
     
     # Credential Input
     with st.expander("🔑 Jira Credentials", expanded=True):
@@ -78,7 +102,7 @@ def main():
     
     if submitted and query and base_url and username and password:
         auth = HTTPBasicAuth(username, password)
-        auth_token = f"{username}|{password}"  # Create hashable token
+        auth_token = f"{username}|{password}"
         
         with st.spinner("Searching Jira..."):
             issues = search_jira(base_url, auth, query, projects, time_frame)
@@ -95,27 +119,37 @@ def main():
                 st.write(f"**Created:** {issue['fields']['created'][:10]}")
                 st.write(issue['fields'].get('description', 'No description'))
                 
-                # OCR Processing
-                if search_images and 'attachment' in issue['fields']:
+                # Attachments
+                if 'attachment' in issue['fields']:
+                    st.subheader("Attachments")
                     for att in issue['fields']['attachment']:
                         if att['mimeType'].startswith('image/'):
-                            with st.spinner(f"Scanning {att['filename']}..."):
-                                # Pass the hashable auth token instead of auth object
-                                text = extract_text(att['content'], auth_token)
-                                if query.lower() in text.lower():
-                                    cols = st.columns([1, 3])
-                                    with cols[0]:
-                                        st.image(att['content'], width=200)
-                                    with cols[1]:
-                                        st.text_area("Extracted Text", text, height=150)
-                                        st.download_button(
-                                            "Download Image",
-                                            data=requests.get(att['content'], auth=auth).content,
-                                            file_name=att['filename']
-                                        )
-                                elif st.button(f"Run OCR on {att['filename']}"):
-                                    text = extract_text(att['content'], auth_token)
-                                    st.text_area("OCR Results", text, height=150)
+                            with st.container(border=True):
+                                st.write(f"**{att['filename']}**")
+                                
+                                # Image display with zoom
+                                show_image_zoomable(att['content'], auth)
+                                
+                                # OCR functionality
+                                if search_images:
+                                    if st.button(f"Run OCR on {att['filename']}", 
+                                               key=f"ocr_{att['id']}"):
+                                        with st.spinner("Extracting text..."):
+                                            text = extract_text(att['content'], auth_token)
+                                            st.text_area("Extracted Text", 
+                                                        text, 
+                                                        height=150,
+                                                        key=f"text_{att['id']}")
+                                        
+                                st.download_button(
+                                    f"Download {att['filename']}",
+                                    data=requests.get(att['content'], auth=auth).content,
+                                    file_name=att['filename'],
+                                    key=f"dl_{att['id']}"
+                                )
 
 if __name__ == "__main__":
+    if 'zoom_' not in st.session_state:
+        st.session_state.update({f"zoom_{k}": False for k in st.session_state.keys() 
+                               if k.startswith('zoom_')})
     main()
